@@ -17,21 +17,56 @@ import {
   ArrowRight,
   Plus,
   Trash2,
-  Volume2
+  Volume2,
+  Lock,
+  LogOut,
+  ShieldCheck,
+  UserPlus,
+  UserMinus
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { 
-  LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend 
-} from 'recharts';
-import { format, differenceInMinutes, startOfDay, subDays, isWithinInterval } from 'date-fns';
-import { Category, Counter, Ticket, AppState, TicketStatus } from './types';
+import { format } from 'date-fns';
+import { Category, Counter, Ticket, AppState, TicketStatus, User, UserRole } from './types';
 import { generateSyntheticData } from './utils/dataGenerator';
 
 // --- Constants & Defaults ---
 const DEFAULT_CATEGORIES: Category[] = [
-  { id: '1', name: 'General', prefix: 'G', color: '#3b82f6' },
-  { id: '2', name: 'Preferencial', prefix: 'P', color: '#ef4444' },
-  { id: '3', name: 'Caja', prefix: 'C', color: '#10b981' },
+  { 
+    id: '1', name: 'Servicio al Cliente', prefix: 'S', color: '#3b82f6',
+    priority: 1,
+    subCategories: [
+      { id: '1-1', name: 'sub_servicio_1' },
+      { id: '1-2', name: 'sub_servicio_2' },
+      { id: '1-3', name: 'sub_servicio_3' }
+    ]
+  },
+  { 
+    id: '2', name: 'Preferencial', prefix: 'P', color: '#ef4444',
+    priority: 3,
+    subCategories: [
+      { id: '2-1', name: 'sub_preferencial_1' },
+      { id: '2-2', name: 'sub_preferencial_2' },
+      { id: '2-3', name: 'sub_preferencial_3' }
+    ]
+  },
+  { 
+    id: '3', name: 'Caja y Pagos', prefix: 'C', color: '#10b981',
+    priority: 1,
+    subCategories: [
+      { id: '3-1', name: 'sub_caja_1' },
+      { id: '3-2', name: 'sub_caja_2' },
+      { id: '3-3', name: 'sub_caja_3' }
+    ]
+  },
+  { 
+    id: '4', name: 'Asesoría Comercial', prefix: 'A', color: '#8b5cf6',
+    priority: 1,
+    subCategories: [
+      { id: '4-1', name: 'sub_comercial_1' },
+      { id: '4-2', name: 'sub_comercial_2' },
+      { id: '4-3', name: 'sub_comercial_3' }
+    ]
+  },
 ];
 
 const DEFAULT_COUNTERS: Counter[] = [
@@ -41,27 +76,69 @@ const DEFAULT_COUNTERS: Counter[] = [
 ];
 
 const STORAGE_KEY = 'queuemaster_state';
+const AUTH_KEY = 'queuemaster_user';
 
 export default function App() {
+  const [user, setUser] = useState<User | null>(() => {
+    const saved = localStorage.getItem(AUTH_KEY);
+    return saved ? JSON.parse(saved) : null;
+  });
   const [view, setView] = useState<'kiosk' | 'advisor' | 'tv' | 'admin' | 'analytics'>('kiosk');
   const [state, setState] = useState<AppState>(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) return JSON.parse(saved);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      // Migration: Ensure all categories have subCategories array and restore defaults if missing for base categories
+      parsed.categories = parsed.categories.map((c: any) => {
+        const defaultCat = DEFAULT_CATEGORIES.find(dc => dc.id === c.id);
+        const subCategories = (c.subCategories && c.subCategories.length > 0) 
+          ? c.subCategories 
+          : (defaultCat?.subCategories || []);
+        
+        return {
+          ...c,
+          subCategories,
+          priority: c.priority || defaultCat?.priority || 1
+        };
+      });
+      return parsed;
+    }
     return {
       categories: DEFAULT_CATEGORIES,
       counters: DEFAULT_COUNTERS,
       tickets: [],
-      nextTicketNumber: { '1': 1, '2': 1, '3': 1 }
+      nextTicketNumber: { '1': 1, '2': 1, '3': 1, '4': 1 }
     };
   });
+
+  const [dbConfig, setDbConfig] = useState<{ usePostgres: boolean, connectionString?: string }>({ usePostgres: false });
+  const [isSyncing, setIsSyncing] = useState(false);
+
+  // Load config from backend
+  useEffect(() => {
+    fetch('/api/config').then(res => res.json()).then(setDbConfig);
+  }, []);
 
   // Persist state
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   }, [state]);
 
+  useEffect(() => {
+    if (user) {
+      localStorage.setItem(AUTH_KEY, JSON.stringify(user));
+      // Set default view based on role
+      if (user.role === 'kiosk') setView('kiosk');
+      else if (user.role === 'display') setView('tv');
+      else if (user.role === 'advisor') setView('advisor');
+      else if (user.role === 'admin') setView('admin');
+    } else {
+      localStorage.removeItem(AUTH_KEY);
+    }
+  }, [user]);
+
   // --- Actions ---
-  const createTicket = (categoryId: string) => {
+  const createTicket = (categoryId: string, customerDocument?: string) => {
     const category = state.categories.find(c => c.id === categoryId);
     if (!category) return;
 
@@ -70,6 +147,7 @@ export default function App() {
       id: crypto.randomUUID(),
       displayId: `${category.prefix}${String(num).padStart(3, '0')}`,
       categoryId,
+      customerDocument,
       status: 'waiting',
       createdAt: Date.now(),
     };
@@ -82,20 +160,40 @@ export default function App() {
         [categoryId]: num + 1
       }
     }));
+
+    // Sync with backend
+    fetch('/api/tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newTicket)
+    });
     
     return newTicket;
   };
 
+  const updateTicketOnBackend = (id: string, updates: Partial<Ticket>) => {
+    fetch(`/api/tickets/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates)
+    });
+  };
+
   const callNextTicket = (counterId: number) => {
-    // Simple priority: Preferencial first, then oldest
     const waitingTickets = state.tickets
       .filter(t => t.status === 'waiting')
       .sort((a, b) => {
         const catA = state.categories.find(c => c.id === a.categoryId);
         const catB = state.categories.find(c => c.id === b.categoryId);
-        if (catA?.prefix === 'P' && catB?.prefix !== 'P') return -1;
-        if (catA?.prefix !== 'P' && catB?.prefix === 'P') return 1;
-        return a.createdAt - b.createdAt;
+        
+        const priorityA = catA?.priority || 1;
+        const priorityB = catB?.priority || 1;
+
+        if (priorityA !== priorityB) {
+          return priorityB - priorityA; // Higher priority first
+        }
+        
+        return a.createdAt - b.createdAt; // Then by arrival time
       });
 
     if (waitingTickets.length === 0) return;
@@ -116,31 +214,47 @@ export default function App() {
           : c
       )
     }));
+
+    updateTicketOnBackend(ticket.id, { status: 'calling', calledAt: now, counterId });
   };
 
   const startServing = (counterId: number) => {
     const counter = state.counters.find(c => c.id === counterId);
     if (!counter?.currentTicketId) return;
 
+    const now = Date.now();
     setState(prev => ({
       ...prev,
       tickets: prev.tickets.map(t => 
         t.id === counter.currentTicketId 
-          ? { ...t, status: 'serving', startedAt: Date.now() } 
+          ? { ...t, status: 'serving', startedAt: now } 
           : t
       )
     }));
+
+    updateTicketOnBackend(counter.currentTicketId, { status: 'serving', startedAt: now });
+  };
+
+  const reprofileTicket = (ticketId: string, subCategoryId: string) => {
+    setState(prev => ({
+      ...prev,
+      tickets: prev.tickets.map(t => 
+        t.id === ticketId ? { ...t, subCategoryId } : t
+      )
+    }));
+    updateTicketOnBackend(ticketId, { subCategoryId });
   };
 
   const completeTicket = (counterId: number, status: 'completed' | 'no-show') => {
     const counter = state.counters.find(c => c.id === counterId);
     if (!counter?.currentTicketId) return;
 
+    const now = Date.now();
     setState(prev => ({
       ...prev,
       tickets: prev.tickets.map(t => 
         t.id === counter.currentTicketId 
-          ? { ...t, status, completedAt: Date.now() } 
+          ? { ...t, status, completedAt: now } 
           : t
       ),
       counters: prev.counters.map(c => 
@@ -149,6 +263,25 @@ export default function App() {
           : c
       )
     }));
+
+    updateTicketOnBackend(counter.currentTicketId, { status, completedAt: now });
+  };
+
+  const saveDbConfig = (config: typeof dbConfig) => {
+    fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config)
+    }).then(() => setDbConfig(config));
+  };
+
+  const setupDb = () => {
+    fetch('/api/setup-db', { method: 'POST' })
+      .then(res => res.json())
+      .then(data => {
+        if (data.error) alert(data.error);
+        else alert("Base de datos configurada correctamente");
+      });
   };
 
   const generateData = () => {
@@ -157,6 +290,21 @@ export default function App() {
       ...prev,
       tickets: [...prev.tickets, ...synthetic]
     }));
+    
+    setIsSyncing(true);
+    // Bulk sync with backend
+    fetch('/api/tickets/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(synthetic)
+    }).then(res => res.json()).then(data => {
+      setIsSyncing(false);
+      if (data.error) alert("Error al sincronizar con DB: " + data.error);
+      else alert(`Sincronización exitosa: ${data.count} turnos registrados en PostgreSQL.`);
+    }).catch(err => {
+      setIsSyncing(false);
+      console.error(err);
+    });
   };
 
   const clearData = () => {
@@ -166,16 +314,6 @@ export default function App() {
   };
 
   // --- Components ---
-
-  const Navigation = () => (
-    <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 px-4 py-2 flex justify-around items-center z-50 md:relative md:border-t-0 md:border-r md:w-20 md:flex-col md:h-screen md:py-8">
-      <NavButton icon={<TicketIcon size={24} />} label="Kiosco" active={view === 'kiosk'} onClick={() => setView('kiosk')} />
-      <NavButton icon={<UserRound size={24} />} label="Asesor" active={view === 'advisor'} onClick={() => setView('advisor')} />
-      <NavButton icon={<Monitor size={24} />} label="TV" active={view === 'tv'} onClick={() => setView('tv')} />
-      <NavButton icon={<LayoutDashboard size={24} />} label="Analytics" active={view === 'analytics'} onClick={() => setView('analytics')} />
-      <NavButton icon={<Settings size={24} />} label="Admin" active={view === 'admin'} onClick={() => setView('admin')} />
-    </nav>
-  );
 
   const NavButton = ({ icon, label, active, onClick }: { icon: React.ReactNode, label: string, active: boolean, onClick: () => void }) => (
     <button 
@@ -187,33 +325,88 @@ export default function App() {
     </button>
   );
 
+  const DbStatus = () => (
+    <div className="hidden md:flex flex-col items-center gap-1 mt-auto mb-4">
+      <div className={`w-3 h-3 rounded-full ${dbConfig.usePostgres ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]' : 'bg-slate-300'}`} />
+      <span className="text-[8px] font-bold uppercase text-slate-400">DB</span>
+    </div>
+  );
+
+  if (!user) {
+    return <LoginView onLogin={setUser} />;
+  }
+
+  const allowedViews = {
+    admin: ['kiosk', 'advisor', 'tv', 'admin'],
+    advisor: ['advisor'],
+    kiosk: ['kiosk'],
+    display: ['tv']
+  }[user.role] || [];
+
   return (
     <div className="min-h-screen bg-[#F8FAFC] flex flex-col md:flex-row font-sans text-slate-900">
-      <Navigation />
+      <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 px-4 py-2 flex justify-around items-center z-50 md:sticky md:top-0 md:border-t-0 md:border-r md:w-20 md:flex-col md:h-screen md:py-8">
+        <div className="hidden md:flex flex-col items-center gap-4 mb-8">
+          <div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-blue-100">
+            <TicketIcon size={20} />
+          </div>
+        </div>
+
+        <div className="flex flex-row md:flex-col flex-1 gap-2 md:gap-6">
+          {allowedViews.includes('kiosk') && (
+            <NavButton icon={<TicketIcon size={24} />} label="Kiosco" active={view === 'kiosk'} onClick={() => setView('kiosk')} />
+          )}
+          {allowedViews.includes('advisor') && (
+            <NavButton icon={<UserRound size={24} />} label="Asesor" active={view === 'advisor'} onClick={() => setView('advisor')} />
+          )}
+          {allowedViews.includes('tv') && (
+            <NavButton icon={<Monitor size={24} />} label="TV" active={view === 'tv'} onClick={() => setView('tv')} />
+          )}
+          {allowedViews.includes('admin') && (
+            <NavButton icon={<Settings size={24} />} label="Admin" active={view === 'admin'} onClick={() => setView('admin')} />
+          )}
+        </div>
+
+        <div className="flex flex-col items-center gap-4 mt-auto mb-4">
+          <DbStatus />
+          <button 
+            onClick={() => setUser(null)}
+            className="p-2 text-slate-300 hover:text-red-500 transition-colors"
+            title="Cerrar Sesión"
+          >
+            <LogOut size={20} />
+          </button>
+        </div>
+      </nav>
       <main className="flex-1 overflow-y-auto pb-20 md:pb-0">
         <AnimatePresence mode="wait">
-          {view === 'kiosk' && <KioskView key="kiosk" categories={state.categories} onIssue={createTicket} />}
-          {view === 'advisor' && (
+          {view === 'kiosk' && allowedViews.includes('kiosk') && <KioskView key="kiosk" categories={state.categories} onIssue={createTicket} />}
+          {view === 'advisor' && allowedViews.includes('advisor') && (
             <AdvisorView 
               key="advisor" 
               counters={state.counters} 
               tickets={state.tickets}
+              categories={state.categories}
               onCall={callNextTicket}
               onStart={startServing}
               onComplete={completeTicket}
+              onReprofile={reprofileTicket}
             />
           )}
-          {view === 'tv' && <TVView key="tv" tickets={state.tickets} counters={state.counters} />}
-          {view === 'admin' && (
+          {view === 'tv' && allowedViews.includes('tv') && <TVView key="tv" tickets={state.tickets} counters={state.counters} />}
+          {view === 'admin' && allowedViews.includes('admin') && (
             <AdminView 
               key="admin" 
               state={state} 
               setState={setState} 
+              dbConfig={dbConfig}
+              isSyncing={isSyncing}
+              onSaveConfig={saveDbConfig}
+              onSetupDb={setupDb}
               onGenerateSynth={generateData}
               onClear={clearData}
             />
           )}
-          {view === 'analytics' && <AnalyticsView key="analytics" tickets={state.tickets} categories={state.categories} />}
         </AnimatePresence>
       </main>
     </div>
@@ -222,13 +415,175 @@ export default function App() {
 
 // --- Sub-Views ---
 
-function KioskView({ categories, onIssue }: { categories: Category[], onIssue: (id: string) => void, key?: React.Key }) {
+function LoginView({ onLogin }: { onLogin: (user: User) => void }) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const passwordRef = React.useRef<HTMLInputElement>(null);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+      if (res.ok) {
+        const user = await res.json();
+        onLogin(user);
+      } else {
+        const data = await res.json();
+        setError(data.error || 'Error al iniciar sesión');
+      }
+    } catch (err) {
+      setError('Error de conexión con el servidor');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleErrorDismiss = () => {
+    setError('');
+    setPassword('');
+    setTimeout(() => {
+      passwordRef.current?.focus();
+    }, 100);
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-900 flex items-center justify-center p-6">
+      <motion.div 
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="w-full max-w-md bg-white rounded-[40px] p-10 shadow-2xl space-y-8"
+      >
+        <div className="text-center space-y-4">
+          <div className="w-20 h-20 bg-blue-600 rounded-3xl flex items-center justify-center text-white mx-auto shadow-xl shadow-blue-200">
+            <ShieldCheck size={40} />
+          </div>
+          <h1 className="text-3xl font-black text-slate-900 tracking-tight">QueueMaster Pro</h1>
+          <p className="text-slate-400 font-medium">Inicie sesión para acceder al sistema</p>
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-6">
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <label className="text-xs font-black text-slate-400 uppercase tracking-widest ml-1">Usuario</label>
+              <div className="relative">
+                <UserRound className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" size={20} />
+                <input 
+                  type="text" 
+                  required
+                  value={username}
+                  onChange={e => setUsername(e.target.value)}
+                  className="w-full pl-12 pr-4 py-4 bg-slate-50 border border-slate-100 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none transition-all font-medium"
+                  placeholder="ej. admin"
+                />
+              </div>
+            </div>
+            <div className="space-y-2">
+              <label className="text-xs font-black text-slate-400 uppercase tracking-widest ml-1">Contraseña</label>
+              <div className="relative">
+                <Lock className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" size={20} />
+                <input 
+                  type="password" 
+                  required
+                  ref={passwordRef}
+                  value={password}
+                  onChange={e => setPassword(e.target.value)}
+                  className="w-full pl-12 pr-4 py-4 bg-slate-50 border border-slate-100 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none transition-all font-medium"
+                  placeholder="••••••••"
+                />
+              </div>
+            </div>
+          </div>
+
+          <AnimatePresence>
+            {error && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-6"
+              >
+                <motion.div
+                  initial={{ scale: 0.9, opacity: 0, y: 20 }}
+                  animate={{ scale: 1, opacity: 1, y: 0 }}
+                  exit={{ scale: 0.9, opacity: 0, y: 20 }}
+                  className="bg-white rounded-[32px] p-8 shadow-2xl max-w-sm w-full text-center space-y-6 border border-slate-100"
+                >
+                  <div className="w-16 h-16 bg-red-100 text-red-600 rounded-full flex items-center justify-center mx-auto">
+                    <Lock size={32} />
+                  </div>
+                  <div className="space-y-2">
+                    <h3 className="text-xl font-bold text-slate-900">Acceso Denegado</h3>
+                    <p className="text-slate-500 text-sm leading-relaxed">{error}</p>
+                  </div>
+                  <button
+                    onClick={handleErrorDismiss}
+                    className="w-full py-4 bg-slate-900 text-white rounded-2xl font-bold hover:bg-slate-800 transition-all"
+                  >
+                    Entendido
+                  </button>
+                </motion.div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          <button 
+            type="submit"
+            disabled={loading}
+            className="w-full py-5 bg-slate-900 text-white rounded-2xl font-bold hover:bg-slate-800 transition-all shadow-xl shadow-slate-200 flex items-center justify-center gap-3 disabled:opacity-50"
+          >
+            {loading ? 'Verificando...' : 'Entrar al Sistema'}
+            {!loading && <ArrowRight size={20} />}
+          </button>
+        </form>
+
+        <div className="pt-4 text-center">
+          <p className="text-xs text-slate-300 font-medium">
+            Consulte con el administrador para obtener sus credenciales.
+          </p>
+          <div className="mt-4 flex justify-center gap-4 text-[10px] text-slate-200 font-bold uppercase tracking-tighter">
+            <span>Kiosco</span>
+            <span>Pantallas</span>
+            <span>Ventanilla</span>
+            <span>Admin</span>
+          </div>
+        </div>
+      </motion.div>
+    </div>
+  );
+}
+
+function KioskView({ categories, onIssue }: { categories: Category[], onIssue: (id: string, doc?: string) => Ticket | undefined, key?: React.Key }) {
   const [lastTicket, setLastTicket] = useState<Ticket | null>(null);
+  const [document, setDocument] = useState('');
+  const [docType, setDocType] = useState('CC');
+  const [step, setStep] = useState<'id' | 'category'>('id');
 
   const handleIssue = (id: string) => {
-    const ticket = (onIssue as any)(id);
-    setLastTicket(ticket);
-    setTimeout(() => setLastTicket(null), 5000);
+    const fullDoc = `${docType} ${document}`;
+    const ticket = onIssue(id, fullDoc);
+    if (ticket) {
+      setLastTicket(ticket);
+      setTimeout(() => {
+        setLastTicket(null);
+        setStep('id');
+        setDocument('');
+        setDocType('CC');
+      }, 2000);
+    }
+  };
+
+  const handleDocChange = (val: string) => {
+    // Only allow numbers
+    const numericValue = val.replace(/[^0-9]/g, '');
+    setDocument(numericValue);
   };
 
   return (
@@ -244,28 +599,75 @@ function KioskView({ categories, onIssue }: { categories: Category[], onIssue: (
             <TicketIcon className="text-white" size={40} />
           </div>
           <h1 className="text-4xl font-bold tracking-tight text-slate-900">Bienvenido</h1>
-          <p className="text-slate-500 text-lg">Seleccione el tipo de trámite para obtener su turno</p>
+          <p className="text-slate-500 text-lg">
+            {step === 'id' ? 'Por favor ingrese su documento de identidad' : 'Seleccione el tipo de trámite'}
+          </p>
         </header>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-          {categories.map(cat => (
-            <button
-              key={cat.id}
-              onClick={() => handleIssue(cat.id)}
-              className="group relative overflow-hidden bg-white p-8 rounded-3xl border border-slate-200 shadow-sm hover:shadow-xl hover:border-blue-200 transition-all text-left"
+        {step === 'id' ? (
+          <div className="bg-white p-8 rounded-[32px] border border-slate-200 shadow-sm space-y-6 max-w-md mx-auto">
+            <div className="flex gap-2">
+              {['CC', 'CE', 'TI'].map(type => (
+                <button
+                  key={type}
+                  onClick={() => setDocType(type)}
+                  className={`flex-1 py-3 rounded-xl font-bold transition-all border ${
+                    docType === type 
+                      ? 'bg-blue-600 border-blue-600 text-white shadow-md' 
+                      : 'bg-slate-50 border-slate-100 text-slate-400 hover:bg-slate-100'
+                  }`}
+                >
+                  {type}
+                </button>
+              ))}
+            </div>
+            <div className="space-y-2">
+              <input 
+                type="text" 
+                inputMode="numeric"
+                placeholder="Número de Documento" 
+                className="w-full px-6 py-4 text-2xl font-bold rounded-2xl border border-slate-200 focus:ring-4 focus:ring-blue-100 outline-none text-center"
+                value={document}
+                onChange={e => handleDocChange(e.target.value)}
+              />
+              <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Solo se permiten números</p>
+            </div>
+            <button 
+              disabled={!document || document.length < 5}
+              onClick={() => setStep('category')}
+              className="w-full bg-blue-600 text-white font-bold py-4 rounded-2xl hover:bg-blue-700 disabled:opacity-50 transition-all flex items-center justify-center gap-2 text-xl"
             >
-              <div className="flex items-center justify-between mb-4">
-                <div className="w-12 h-12 rounded-2xl flex items-center justify-center" style={{ backgroundColor: `${cat.color}15`, color: cat.color }}>
-                  <TicketIcon size={24} />
-                </div>
-                <ArrowRight className="text-slate-300 group-hover:text-blue-500 transition-colors" />
-              </div>
-              <h3 className="text-xl font-bold text-slate-800">{cat.name}</h3>
-              <p className="text-slate-400 text-sm mt-1">Prefijo: {cat.prefix}</p>
-              <div className="absolute bottom-0 left-0 h-1 w-0 group-hover:w-full transition-all duration-500" style={{ backgroundColor: cat.color }} />
+              Continuar
+              <ArrowRight size={24} />
             </button>
-          ))}
-        </div>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+            {categories.map(cat => (
+              <button
+                key={cat.id}
+                onClick={() => handleIssue(cat.id)}
+                className="group relative overflow-hidden bg-white p-8 rounded-3xl border border-slate-200 shadow-sm hover:shadow-xl hover:border-blue-200 transition-all text-left"
+              >
+                <div className="flex items-center justify-between mb-4">
+                  <div className="w-12 h-12 rounded-2xl flex items-center justify-center" style={{ backgroundColor: `${cat.color}15`, color: cat.color }}>
+                    <TicketIcon size={24} />
+                  </div>
+                  <ArrowRight className="text-slate-300 group-hover:text-blue-500 transition-colors" />
+                </div>
+                <h3 className="text-xl font-bold text-slate-800">{cat.name}</h3>
+                <p className="text-slate-400 text-sm mt-1">Prefijo: {cat.prefix}</p>
+                <div className="absolute bottom-0 left-0 h-1 w-0 group-hover:w-full transition-all duration-500" style={{ backgroundColor: cat.color }} />
+              </button>
+            ))}
+            <button 
+              onClick={() => setStep('id')}
+              className="sm:col-span-2 text-slate-400 hover:text-slate-600 font-medium"
+            >
+              ← Volver a ingresar documento
+            </button>
+          </div>
+        )}
 
         <AnimatePresence>
           {lastTicket && (
@@ -282,6 +684,9 @@ function KioskView({ categories, onIssue }: { categories: Category[], onIssue: (
                 <div>
                   <p className="text-slate-400 uppercase tracking-widest text-xs font-bold">Su Turno es</p>
                   <h2 className="text-7xl font-black text-slate-900 tracking-tighter">{lastTicket.displayId}</h2>
+                  {lastTicket.customerDocument && (
+                    <p className="text-slate-400 text-sm mt-2">ID: {lastTicket.customerDocument}</p>
+                  )}
                 </div>
                 <p className="text-slate-500 text-sm">Por favor, espere a ser llamado en la pantalla principal.</p>
                 <div className="pt-4">
@@ -289,7 +694,7 @@ function KioskView({ categories, onIssue }: { categories: Category[], onIssue: (
                     <motion.div 
                       initial={{ width: '100%' }}
                       animate={{ width: '0%' }}
-                      transition={{ duration: 5, ease: 'linear' }}
+                      transition={{ duration: 2, ease: 'linear' }}
                       className="h-full bg-blue-500"
                     />
                   </div>
@@ -303,12 +708,14 @@ function KioskView({ categories, onIssue }: { categories: Category[], onIssue: (
   );
 }
 
-function AdvisorView({ counters, tickets, onCall, onStart, onComplete }: { 
+function AdvisorView({ counters, tickets, categories, onCall, onStart, onComplete, onReprofile }: { 
   counters: Counter[], 
   tickets: Ticket[],
+  categories: Category[],
   onCall: (id: number) => void,
   onStart: (id: number) => void,
   onComplete: (id: number, status: 'completed' | 'no-show') => void,
+  onReprofile: (ticketId: string, subCategoryId: string) => void,
   key?: React.Key
 }) {
   const [selectedCounterId, setSelectedCounterId] = useState<number | null>(null);
@@ -316,6 +723,8 @@ function AdvisorView({ counters, tickets, onCall, onStart, onComplete }: {
   const activeCounter = counters.find(c => c.id === selectedCounterId);
   const activeTicket = tickets.find(t => t.id === activeCounter?.currentTicketId);
   const waitingCount = tickets.filter(t => t.status === 'waiting').length;
+
+  const currentCategory = categories.find(c => c.id === activeTicket?.categoryId);
 
   return (
     <motion.div 
@@ -328,11 +737,20 @@ function AdvisorView({ counters, tickets, onCall, onStart, onComplete }: {
           <h1 className="text-3xl font-bold text-slate-900">Panel del Asesor</h1>
           <p className="text-slate-500">Gestione la atención de clientes en su ventanilla</p>
         </div>
-        <div className="flex items-center gap-3 bg-white p-2 rounded-2xl border border-slate-200 shadow-sm">
-          <div className="px-4 py-2 bg-blue-50 text-blue-700 rounded-xl flex items-center gap-2">
-            <Users size={18} />
-            <span className="font-bold">{waitingCount}</span>
-            <span className="text-xs font-medium uppercase">En espera</span>
+        <div className="flex items-center gap-3">
+          <button 
+            onClick={() => window.location.reload()} 
+            className="p-2 bg-white border border-slate-200 rounded-xl text-slate-400 hover:text-blue-600 transition-all"
+            title="Refrescar datos"
+          >
+            <Clock size={20} />
+          </button>
+          <div className="flex items-center gap-3 bg-white p-2 rounded-2xl border border-slate-200 shadow-sm">
+            <div className="px-4 py-2 bg-blue-50 text-blue-700 rounded-xl flex items-center gap-2">
+              <Users size={18} />
+              <span className="font-bold">{waitingCount}</span>
+              <span className="text-xs font-medium uppercase">En espera</span>
+            </div>
           </div>
         </div>
       </header>
@@ -386,7 +804,42 @@ function AdvisorView({ counters, tickets, onCall, onStart, onComplete }: {
                     <div className="space-y-2">
                       <p className="text-slate-400 uppercase tracking-widest text-xs font-bold">Atendiendo ahora</p>
                       <h2 className="text-8xl font-black text-slate-900 tracking-tighter">{activeTicket.displayId}</h2>
+                      {activeTicket.customerDocument && (
+                        <p className="text-blue-600 font-bold text-xl">Documento: {activeTicket.customerDocument}</p>
+                      )}
                     </div>
+
+                    {/* Re-profiling Section */}
+                    {(activeTicket.status === 'serving' || activeTicket.status === 'calling') && (
+                      <div className="bg-slate-50 p-6 rounded-2xl border border-slate-200 text-left space-y-4">
+                        <h4 className="font-bold text-slate-700 flex items-center gap-2">
+                          <Settings size={18} />
+                          Tipificación de Atención
+                        </h4>
+                        {currentCategory?.subCategories && currentCategory.subCategories.length > 0 ? (
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            {currentCategory.subCategories.map(sub => (
+                              <button
+                                key={sub.id}
+                                onClick={() => onReprofile(activeTicket.id, sub.id)}
+                                className={`px-4 py-3 rounded-xl border font-medium transition-all text-sm ${
+                                  activeTicket.subCategoryId === sub.id 
+                                    ? 'bg-blue-600 border-blue-600 text-white shadow-md' 
+                                    : 'bg-white border-slate-200 text-slate-600 hover:border-blue-300'
+                                }`}
+                              >
+                                {sub.name}
+                              </button>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="p-4 bg-white border border-dashed border-slate-300 rounded-xl text-center">
+                            <p className="text-slate-400 text-sm">No hay sub-categorías configuradas para esta categoría.</p>
+                            <p className="text-xs text-slate-400 mt-1">Configure las tipificaciones en el panel de Admin.</p>
+                          </div>
+                        )}
+                      </div>
+                    )}
                     
                     <div className="flex flex-wrap justify-center gap-4">
                       {activeTicket.status === 'calling' && (
@@ -448,7 +901,10 @@ function AdvisorView({ counters, tickets, onCall, onStart, onComplete }: {
               <div className="space-y-3">
                 {tickets.filter(t => t.status === 'waiting').slice(0, 5).map(t => (
                   <div key={t.id} className="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
-                    <span className="font-bold text-slate-700">{t.displayId}</span>
+                    <div className="flex flex-col">
+                      <span className="font-bold text-slate-700">{t.displayId}</span>
+                      {t.customerDocument && <span className="text-[10px] text-slate-400">ID: {t.customerDocument}</span>}
+                    </div>
                     <span className="text-xs text-slate-400 font-medium">{format(t.createdAt, 'HH:mm')}</span>
                   </div>
                 ))}
@@ -471,13 +927,6 @@ function TVView({ tickets, counters }: { tickets: Ticket[], counters: Counter[],
     .slice(0, 6);
 
   const lastCalled = callingTickets[0];
-
-  // Sound effect simulation (visual only in this context)
-  useEffect(() => {
-    if (lastCalled?.status === 'calling') {
-      // In a real app: new Audio('/ding.mp3').play();
-    }
-  }, [lastCalled?.id]);
 
   return (
     <motion.div 
@@ -590,24 +1039,66 @@ function TVView({ tickets, counters }: { tickets: Ticket[], counters: Counter[],
   );
 }
 
-function AdminView({ state, setState, onGenerateSynth, onClear }: { 
+function AdminView({ state, setState, dbConfig, isSyncing, onSaveConfig, onSetupDb, onGenerateSynth, onClear }: { 
   state: AppState, 
   setState: React.Dispatch<React.SetStateAction<AppState>>,
+  dbConfig: { usePostgres: boolean, connectionString?: string },
+  isSyncing: boolean,
+  onSaveConfig: (config: any) => void,
+  onSetupDb: () => void,
   onGenerateSynth: () => void,
   onClear: () => void,
   key?: React.Key
 }) {
-  const [newCat, setNewCat] = useState({ name: '', prefix: '', color: '#3b82f6' });
+  const [newCat, setNewCat] = useState({ name: '', prefix: '', color: '#3b82f6', priority: 1 });
+  const [localDbConfig, setLocalDbConfig] = useState(dbConfig);
+  const [users, setUsers] = useState<User[]>([]);
+  const [newUser, setNewUser] = useState({ username: '', password: '', role: 'advisor' as UserRole, name: '' });
+
+  useEffect(() => {
+    fetch('/api/users').then(res => res.json()).then(setUsers);
+  }, []);
+
+  const handleAddUser = async () => {
+    if (!newUser.username || !newUser.password || !newUser.name) return;
+    const res = await fetch('/api/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newUser)
+    });
+    if (res.ok) {
+      const user = await res.json();
+      setUsers([...users, user]);
+      setNewUser({ username: '', password: '', role: 'advisor', name: '' });
+    }
+  };
+
+  const handleDeleteUser = async (id: string) => {
+    if (confirm('¿Eliminar usuario?')) {
+      const res = await fetch(`/api/users/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        setUsers(users.filter(u => u.id !== id));
+      }
+    }
+  };
+
+  useEffect(() => {
+    setLocalDbConfig(dbConfig);
+  }, [dbConfig]);
 
   const addCategory = () => {
     if (!newCat.name || !newCat.prefix) return;
     const id = crypto.randomUUID();
+    const subCategories = [
+      { id: `${id}-1`, name: `sub_${newCat.name.toLowerCase().replace(/\s+/g, '_')}_1` },
+      { id: `${id}-2`, name: `sub_${newCat.name.toLowerCase().replace(/\s+/g, '_')}_2` }
+    ];
     setState(prev => ({
       ...prev,
-      categories: [...prev.categories, { ...newCat, id }],
+      categories: [...prev.categories, { ...newCat, id, subCategories }],
       nextTicketNumber: { ...prev.nextTicketNumber, [id]: 1 }
     }));
-    setNewCat({ name: '', prefix: '', color: '#3b82f6' });
+    setNewCat({ name: '', prefix: '', color: '#3b82f6', priority: 1 });
   };
 
   const removeCategory = (id: string) => {
@@ -625,8 +1116,128 @@ function AdminView({ state, setState, onGenerateSynth, onClear }: {
     >
       <header>
         <h1 className="text-3xl font-bold text-slate-900">Configuración del Sistema</h1>
-        <p className="text-slate-500">Administre categorías, ventanillas y datos del sistema</p>
+        <p className="text-slate-500">Administre usuarios, categorías y base de datos</p>
       </header>
+
+      {/* User Management */}
+      <section className="bg-white p-8 rounded-[32px] border border-slate-200 shadow-sm space-y-6">
+        <h3 className="text-xl font-bold flex items-center gap-2">
+          <Users className="text-blue-500" />
+          Gestión de Usuarios
+        </h3>
+        
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+          <input 
+            type="text" 
+            placeholder="Nombre" 
+            className="px-4 py-3 rounded-xl border border-slate-200 text-sm outline-none"
+            value={newUser.name}
+            onChange={e => setNewUser({ ...newUser, name: e.target.value })}
+          />
+          <input 
+            type="text" 
+            placeholder="Usuario" 
+            className="px-4 py-3 rounded-xl border border-slate-200 text-sm outline-none"
+            value={newUser.username}
+            onChange={e => setNewUser({ ...newUser, username: e.target.value })}
+          />
+          <input 
+            type="password" 
+            placeholder="Contraseña" 
+            className="px-4 py-3 rounded-xl border border-slate-200 text-sm outline-none"
+            value={newUser.password}
+            onChange={e => setNewUser({ ...newUser, password: e.target.value })}
+          />
+          <select 
+            className="px-4 py-3 rounded-xl border border-slate-200 text-sm outline-none bg-white"
+            value={newUser.role}
+            onChange={e => setNewUser({ ...newUser, role: e.target.value as UserRole })}
+          >
+            <option value="admin">Admin</option>
+            <option value="advisor">Asesor</option>
+            <option value="kiosk">Kiosco</option>
+            <option value="display">Pantalla</option>
+          </select>
+          <button 
+            onClick={handleAddUser}
+            className="bg-blue-600 text-white font-bold py-3 rounded-xl hover:bg-blue-700 transition-all flex items-center justify-center gap-2"
+          >
+            <UserPlus size={20} />
+            Añadir
+          </button>
+        </div>
+
+        <div className="space-y-2 pt-4">
+          {users.map(u => (
+            <div key={u.id} className="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
+              <div className="flex items-center gap-4">
+                <div className="w-10 h-10 bg-white rounded-xl flex items-center justify-center text-slate-400 border border-slate-100">
+                  <UserRound size={20} />
+                </div>
+                <div>
+                  <p className="font-bold text-slate-800">{u.name} <span className="text-xs font-normal text-slate-400">(@{u.username})</span></p>
+                  <span className="px-2 py-0.5 bg-blue-100 text-blue-600 rounded-md text-[10px] font-black uppercase tracking-widest">{u.role}</span>
+                </div>
+              </div>
+              <button 
+                onClick={() => handleDeleteUser(u.id)}
+                className="text-slate-300 hover:text-red-500 transition-colors p-2"
+              >
+                <UserMinus size={18} />
+              </button>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* Database Configuration */}
+      <section className="bg-white p-8 rounded-[32px] border border-slate-200 shadow-sm space-y-6">
+        <h3 className="text-xl font-bold flex items-center gap-2">
+          <Monitor className="text-blue-500" />
+          Conexión a Base de Datos (PostgreSQL)
+        </h3>
+        <div className="space-y-4">
+          <div className="flex items-center gap-3">
+            <input 
+              type="checkbox" 
+              id="usePostgres"
+              checked={localDbConfig.usePostgres}
+              onChange={e => setLocalDbConfig({ ...localDbConfig, usePostgres: e.target.checked })}
+              className="w-5 h-5 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+            />
+            <label htmlFor="usePostgres" className="font-medium text-slate-700">Usar PostgreSQL como backend</label>
+          </div>
+          
+          {localDbConfig.usePostgres && (
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <label className="text-sm font-bold text-slate-500 uppercase tracking-widest">Connection String</label>
+                <input 
+                  type="text" 
+                  placeholder="postgres://user:pass@host:port/db" 
+                  className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none font-mono text-sm"
+                  value={localDbConfig.connectionString || ''}
+                  onChange={e => setLocalDbConfig({ ...localDbConfig, connectionString: e.target.value })}
+                />
+              </div>
+              <div className="flex gap-3">
+                <button 
+                  onClick={() => onSaveConfig(localDbConfig)}
+                  className="px-6 py-3 bg-blue-600 text-white font-bold rounded-xl hover:bg-blue-700 transition-all"
+                >
+                  Guardar Configuración
+                </button>
+                <button 
+                  onClick={onSetupDb}
+                  className="px-6 py-3 bg-slate-100 text-slate-600 font-bold rounded-xl hover:bg-slate-200 transition-all"
+                >
+                  Inicializar Tablas
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
 
       <section className="bg-white p-8 rounded-[32px] border border-slate-200 shadow-sm space-y-6">
         <h3 className="text-xl font-bold flex items-center gap-2">
@@ -634,7 +1245,7 @@ function AdminView({ state, setState, onGenerateSynth, onClear }: {
           Categorías de Trámites
         </h3>
         
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
           <input 
             type="text" 
             placeholder="Nombre (ej. Caja)" 
@@ -650,6 +1261,17 @@ function AdminView({ state, setState, onGenerateSynth, onClear }: {
             value={newCat.prefix}
             onChange={e => setNewCat({ ...newCat, prefix: e.target.value.toUpperCase() })}
           />
+          <div className="flex items-center gap-2 px-4 py-3 rounded-xl border border-slate-200">
+            <label className="text-xs font-bold text-slate-400 uppercase">Peso:</label>
+            <input 
+              type="number" 
+              min="1" 
+              max="10"
+              className="w-full outline-none font-bold text-blue-600"
+              value={newCat.priority}
+              onChange={e => setNewCat({ ...newCat, priority: parseInt(e.target.value) || 1 })}
+            />
+          </div>
           <button 
             onClick={addCategory}
             className="bg-blue-600 text-white font-bold py-3 rounded-xl hover:bg-blue-700 transition-all flex items-center justify-center gap-2"
@@ -659,19 +1281,85 @@ function AdminView({ state, setState, onGenerateSynth, onClear }: {
           </button>
         </div>
 
-        <div className="space-y-3 pt-4">
+        <div className="space-y-4 pt-4">
           {state.categories.map(cat => (
-            <div key={cat.id} className="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
-              <div className="flex items-center gap-4">
-                <div className="w-4 h-4 rounded-full" style={{ backgroundColor: cat.color }} />
-                <div>
-                  <span className="font-bold text-slate-800">{cat.name}</span>
-                  <span className="ml-2 text-xs font-bold text-slate-400 uppercase tracking-widest">({cat.prefix})</span>
+            <div key={cat.id} className="space-y-3 p-6 bg-slate-50 rounded-[32px] border border-slate-100">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <div className="w-4 h-4 rounded-full" style={{ backgroundColor: cat.color }} />
+                  <div>
+                    <span className="font-bold text-slate-800 text-lg">{cat.name}</span>
+                    <span className="ml-2 text-xs font-bold text-slate-400 uppercase tracking-widest">({cat.prefix})</span>
+                  </div>
+                </div>
+                <div className="flex items-center gap-4">
+                  <div className="flex items-center gap-2 bg-white px-3 py-1.5 rounded-lg border border-slate-200">
+                    <span className="text-[10px] font-black uppercase text-slate-400">Prioridad:</span>
+                    <input 
+                      type="number" 
+                      min="1" 
+                      max="10"
+                      className="w-10 text-center font-bold text-blue-600 outline-none"
+                      value={cat.priority}
+                      onChange={e => {
+                        const priority = parseInt(e.target.value) || 1;
+                        setState(prev => ({
+                          ...prev,
+                          categories: prev.categories.map(c => c.id === cat.id ? { ...c, priority } : c)
+                        }));
+                      }}
+                    />
+                  </div>
+                  <button onClick={() => removeCategory(cat.id)} className="text-slate-300 hover:text-red-500 transition-colors p-2">
+                    <Trash2 size={20} />
+                  </button>
                 </div>
               </div>
-              <button onClick={() => removeCategory(cat.id)} className="text-slate-300 hover:text-red-500 transition-colors">
-                <Trash2 size={18} />
-              </button>
+
+              <div className="space-y-3 pl-8">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">Sub-categorías (Tipificaciones)</h4>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {cat.subCategories?.map(sub => (
+                    <div key={sub.id} className="flex items-center gap-2 bg-white px-3 py-1.5 rounded-lg border border-slate-200 text-sm font-medium text-slate-600">
+                      {sub.name}
+                      <button 
+                        onClick={() => {
+                          setState(prev => ({
+                            ...prev,
+                            categories: prev.categories.map(c => c.id === cat.id ? {
+                              ...c,
+                              subCategories: c.subCategories?.filter(s => s.id !== sub.id)
+                            } : c)
+                          }));
+                        }}
+                        className="text-slate-300 hover:text-red-400"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  ))}
+                  <button 
+                    onClick={() => {
+                      const name = prompt('Nombre de la sub-categoría:');
+                      if (name) {
+                        setState(prev => ({
+                          ...prev,
+                          categories: prev.categories.map(c => c.id === cat.id ? {
+                            ...c,
+                            subCategories: [...(c.subCategories || []), { id: crypto.randomUUID(), name }]
+                          } : c)
+                        }));
+                      }
+                    }}
+                    className="flex items-center gap-1 px-3 py-1.5 rounded-lg border border-dashed border-slate-300 text-sm font-bold text-slate-400 hover:border-blue-400 hover:text-blue-500 transition-all"
+                  >
+                    <Plus size={14} />
+                    Añadir
+                  </button>
+                </div>
+              </div>
             </div>
           ))}
         </div>
@@ -680,25 +1368,39 @@ function AdminView({ state, setState, onGenerateSynth, onClear }: {
       <section className="bg-white p-8 rounded-[32px] border border-slate-200 shadow-sm space-y-6">
         <h3 className="text-xl font-bold flex items-center gap-2">
           <LayoutDashboard className="text-purple-500" />
-          Gestión de Datos
+          Gestión de Datos Operativos
         </h3>
-        <p className="text-slate-500 text-sm">Utilice estas herramientas para poblar el sistema con datos de prueba o limpiar el historial.</p>
+        <p className="text-slate-500 text-sm">Herramientas para mantenimiento y pruebas del sistema.</p>
         
         <div className="flex flex-wrap gap-4">
           <button 
             onClick={onGenerateSynth}
-            className="px-6 py-3 bg-purple-50 text-purple-700 border border-purple-100 rounded-xl font-bold hover:bg-purple-100 transition-all flex items-center gap-2"
+            disabled={isSyncing}
+            className="px-6 py-3 bg-purple-50 text-purple-700 border border-purple-100 rounded-xl font-bold hover:bg-purple-100 transition-all flex items-center gap-2 disabled:opacity-50"
           >
-            <Plus size={20} />
-            Generar 6 meses de datos sintéticos
+            {isSyncing ? (
+              <>
+                <div className="w-4 h-4 border-2 border-purple-700 border-t-transparent rounded-full animate-spin" />
+                Sincronizando con DB...
+              </>
+            ) : (
+              <>
+                <Plus size={20} />
+                Generar Datos de Prueba (Auditoría)
+              </>
+            )}
           </button>
           <button 
             onClick={onClear}
             className="px-6 py-3 bg-red-50 text-red-700 border border-red-100 rounded-xl font-bold hover:bg-red-100 transition-all flex items-center gap-2"
           >
             <Trash2 size={20} />
-            Borrar todo el historial
+            Limpiar Historial Local
           </button>
+        </div>
+        <div className="pt-6 border-t border-slate-100 flex justify-between items-center text-[10px] font-black uppercase tracking-widest text-slate-300">
+          <span>QueueMaster Pro - Versión Definitiva</span>
+          <span>v1.0.0 - 2024</span>
         </div>
       </section>
     </motion.div>
@@ -706,120 +1408,5 @@ function AdminView({ state, setState, onGenerateSynth, onClear }: {
 }
 
 function AnalyticsView({ tickets, categories }: { tickets: Ticket[], categories: Category[], key?: React.Key }) {
-  const stats = useMemo(() => {
-    const completed = tickets.filter(t => t.status === 'completed');
-    const noShows = tickets.filter(t => t.status === 'no-show');
-    
-    const tme = completed.reduce((acc, t) => acc + ((t.calledAt || 0) - t.createdAt), 0) / (completed.length || 1);
-    const tma = completed.reduce((acc, t) => acc + ((t.completedAt || 0) - (t.startedAt || t.calledAt || 0)), 0) / (completed.length || 1);
-    
-    const abandonmentRate = (noShows.length / (tickets.length || 1)) * 100;
-
-    // Volume by day (last 30 days)
-    const last30Days = Array.from({ length: 30 }, (_, i) => {
-      const date = subDays(new Date(), i);
-      const start = startOfDay(date).getTime();
-      const end = start + 24 * 60 * 60 * 1000;
-      const count = tickets.filter(t => t.createdAt >= start && t.createdAt < end).length;
-      return { date: format(date, 'dd/MM'), count };
-    }).reverse();
-
-    // Volume by category
-    const categoryData = categories.map(cat => ({
-      name: cat.name,
-      value: tickets.filter(t => t.categoryId === cat.id).length,
-      color: cat.color
-    }));
-
-    return {
-      tme: Math.round(tme / 60000),
-      tma: Math.round(tma / 60000),
-      total: tickets.length,
-      abandonmentRate: Math.round(abandonmentRate),
-      last30Days,
-      categoryData
-    };
-  }, [tickets, categories]);
-
-  return (
-    <motion.div 
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      className="p-6 md:p-10 max-w-7xl mx-auto space-y-8"
-    >
-      <header>
-        <h1 className="text-3xl font-bold text-slate-900">Analytics & KPIs</h1>
-        <p className="text-slate-500">Monitoreo de desempeño y flujo de atención</p>
-      </header>
-
-      {/* KPI Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-        <KPICard label="T. Medio Espera" value={`${stats.tme} min`} icon={<Clock className="text-blue-500" />} trend="+2% vs ayer" />
-        <KPICard label="T. Medio Atención" value={`${stats.tma} min`} icon={<CheckCircle2 className="text-green-500" />} trend="-5% vs ayer" />
-        <KPICard label="Total Turnos" value={stats.total.toLocaleString()} icon={<Users className="text-purple-500" />} trend="+12% vs mes ant." />
-        <KPICard label="Tasa Abandono" value={`${stats.abandonmentRate}%`} icon={<Trash2 className="text-red-500" />} trend="Estable" />
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* Main Chart */}
-        <div className="lg:col-span-2 bg-white p-8 rounded-[32px] border border-slate-200 shadow-sm space-y-6">
-          <h3 className="text-xl font-bold">Volumen de Turnos (Últimos 30 días)</h3>
-          <div className="h-[300px] w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={stats.last30Days}>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
-                <XAxis dataKey="date" axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: '#94a3b8' }} />
-                <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: '#94a3b8' }} />
-                <Tooltip 
-                  contentStyle={{ borderRadius: '16px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)' }}
-                />
-                <Line type="monotone" dataKey="count" stroke="#3b82f6" strokeWidth={3} dot={false} activeDot={{ r: 6, strokeWidth: 0 }} />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-
-        {/* Category Distribution */}
-        <div className="bg-white p-8 rounded-[32px] border border-slate-200 shadow-sm space-y-6">
-          <h3 className="text-xl font-bold">Distribución por Trámite</h3>
-          <div className="h-[300px] w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie
-                  data={stats.categoryData}
-                  innerRadius={60}
-                  outerRadius={80}
-                  paddingAngle={5}
-                  dataKey="value"
-                >
-                  {stats.categoryData.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill={entry.color} />
-                  ))}
-                </Pie>
-                <Tooltip />
-                <Legend verticalAlign="bottom" height={36}/>
-              </PieChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-      </div>
-    </motion.div>
-  );
-}
-
-function KPICard({ label, value, icon, trend }: { label: string, value: string | number, icon: React.ReactNode, trend: string }) {
-  return (
-    <div className="bg-white p-6 rounded-[32px] border border-slate-200 shadow-sm space-y-4">
-      <div className="flex items-center justify-between">
-        <div className="w-10 h-10 bg-slate-50 rounded-xl flex items-center justify-center">
-          {icon}
-        </div>
-        <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{trend}</span>
-      </div>
-      <div>
-        <p className="text-slate-500 text-sm font-medium">{label}</p>
-        <h4 className="text-3xl font-black text-slate-900 tracking-tight">{value}</h4>
-      </div>
-    </div>
-  );
+  return null;
 }

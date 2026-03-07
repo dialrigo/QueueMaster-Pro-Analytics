@@ -1,11 +1,26 @@
 
 export type TicketStatus = 'waiting' | 'calling' | 'serving' | 'completed' | 'no-show';
+export type UserRole = 'kiosk' | 'display' | 'advisor' | 'admin';
+
+export interface User {
+  id: string;
+  username: string;
+  role: UserRole;
+  name: string;
+}
 
 export interface Category {
   id: string;
   name: string;
   prefix: string;
   color: string;
+  priority: number;
+  subCategories?: SubCategory[];
+}
+
+export interface SubCategory {
+  id: string;
+  name: string;
 }
 
 export interface Counter {
@@ -19,6 +34,8 @@ export interface Ticket {
   id: string;
   displayId: string;
   categoryId: string;
+  subCategoryId?: string;
+  customerDocument?: string;
   status: TicketStatus;
   createdAt: number;
   calledAt?: number;
